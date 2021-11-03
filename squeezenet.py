@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-DEVICE = torch.device('cuda')
+import torchvision
+import os
+from train import train
+from transform import get_transform
 
 layers_configuration = [
     [2, 16, 64, 64, 'complex'],
@@ -28,8 +30,11 @@ class Fire(nn.Module):
         """
         super(Fire, self).__init__()
         self.squeeze_conv = nn.Conv2d(in_channels=input_channels, out_channels=s1, kernel_size=1)
+        self.bn_squeeze = nn.BatchNorm2d(s1)
         self.expand_1x1 = nn.Conv2d(in_channels=s1, out_channels=e1, kernel_size=1)
+        self.bn_1x1 = nn.BatchNorm2d(e1)
         self.expand_3x3 = nn.Conv2d(in_channels=s1, out_channels=e3, kernel_size=3, padding=1)
+        self.bn_3x3 = nn.BatchNorm2d(e3)
         self.skip_connection_type = skip_connection_type
         if self.skip_connection_type == 'complex':
             self.skip_connection = nn.Conv2d(input_channels, e1+e3, kernel_size=1)
@@ -38,8 +43,10 @@ class Fire(nn.Module):
 
     def forward(self, x):
         identity = x
-        out = self.squeeze_conv(x)
-        out = torch.cat((self.expand_1x1(out), self.expand_3x3(out)), dim=1)
+        out = self.bn_squeeze(self.squeeze_conv(x))
+        out_branch_1 = self.bn_1x1(self.expand_1x1(out))
+        out_branch_2 = self.bn_3x3(self.expand_3x3(out))
+        out = torch.cat((out_branch_1, out_branch_2), dim=1)
         out = F.relu(out)
         if self.skip_connection_type:
             out += self.skip_connection(identity)
@@ -49,10 +56,13 @@ class SqueezeNet(nn.Module):
     def __init__(self, configuration=layers_configuration, skip_connection_type=None):
         super(SqueezeNet, self).__init__()
         self.conv1 = nn.Conv2d(3, 96, 7, padding=3, stride=2)
+        self.bn1 = nn.BatchNorm2d(96)
         self.mp1 = nn.MaxPool2d(kernel_size=3, stride=2)
         input_channels, self.fire_layers = self.create_fire_layers(configuration, skip_connection_type)
+        self.dropout = nn.Dropout2d(0.5)
         self.conv10 = nn.Conv2d(input_channels, out_channels=1000, kernel_size=1, stride=1)
         self.avg_pool10 = nn.AvgPool2d(kernel_size=13, stride=1)
+        self._init_weights()
 
     def create_fire_layers(self, configuration, network_skip_connection_type):
         layers = []
@@ -90,18 +100,47 @@ class SqueezeNet(nn.Module):
             return 'complex'
         return None
 
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
     def forward(self, x):
         x = self.conv1(x)
+        x = self.bn1(x)
         x = self.mp1(x)
         x = self.fire_layers(x)
+        x = self.dropout(x)
         x = self.conv10(x)
         x = self.avg_pool10(x)
-        return x
+        return torch.squeeze(x)
 
 if __name__ == "__main__":
-    model = SqueezeNet(configuration=layers_configuration, skip_connection_type='complex')
-    model.to(DEVICE)
-    input_tensor = torch.rand(2, 3, 224, 224).to(DEVICE)
-    output_tensor = model(input_tensor)
+    IMAGE_SIZE = 224
+    BATCH_SIZE = 4
+    DEVICE = torch.device('cuda')
+    ROOT = 'data'
+    NUM_EPOCHS = 2
+    LR = 0.0001
+    MOMENTUM = 0.9
 
-    print(output_tensor.shape)
+    transforms = {phase: get_transform(phase, IMAGE_SIZE) for phase in ['train', 'val']}
+    datasets = {
+        phase: torchvision.datasets.ImageFolder(os.path.join(ROOT, phase), transform=transforms[phase])
+        for phase in ['train', 'val']
+    }
+
+    dataloaders = {
+        phase: torch.utils.data.DataLoader(datasets[phase], batch_size=BATCH_SIZE, shuffle=True) for phase in
+        ['train', 'val']
+    }
+    model = SqueezeNet(skip_connection_type='complex')
+    model.conv10 = nn.Conv2d(512, out_channels=10, kernel_size=1, stride=1)
+    model.avg_pool10 = nn.AvgPool2d(kernel_size=13, stride=1)
+
+    model.to(DEVICE)
+    criterion = torch.nn.CrossEntropyLoss(reduction='mean')
+    opt = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
+    model, accuracy_history, loss_history = train(model, NUM_EPOCHS, dataloaders, BATCH_SIZE, opt, criterion, DEVICE)
