@@ -1,2 +1,2 @@
 # cv-models
-implementations of some CV models for classification
+implementations of some CV models for image classification
